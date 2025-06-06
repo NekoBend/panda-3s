@@ -101,24 +101,22 @@ class PandaSearch:
         self,
         model_name_or_path: str = "all-MiniLM-L6-v2",
         device: str | None = None,
-        cache_folder: str | None = None,
+        model_cache: str | None = None,
         trust_remote_code: bool = False,
         enable_cache: bool = True,
-        cache_dir: str = "./panda_3s_cache",
+        embedding_cache: str = "./panda_3s_cache",
         use_row_caching: bool = False,
     ) -> "PandaSearch":
         """Build embeddings and index for the DataFrame.
 
         This method handles all embedding-related configuration including
-        model selection, device management, and cache settings.
-
-        Args:
+        model selection, device management, and cache settings.        Args:
             model_name_or_path: Name or path of the SentenceTransformer model
             device: Device to run the model on (auto-detected if None)
-            cache_folder: Folder to cache model files
+            model_cache: Folder to cache model files
             trust_remote_code: Whether to trust remote code
             enable_cache: Whether to enable embedding caching
-            cache_dir: Directory for embedding cache files
+            embedding_cache: Directory for embedding cache files
             use_row_caching: Whether to use row-level caching (more granular)
 
         Returns:
@@ -126,23 +124,23 @@ class PandaSearch:
         """
         logger.info(
             f"Starting embedding process: model={model_name_or_path}, columns={self.text_columns}"
-        )
-
-        # Initialize embedding model
+        )  # Initialize embedding model
         self.embedding_model = Embedding(
             model_name_or_path=model_name_or_path,
             device=device,
-            cache_folder=cache_folder,
+            cache_folder=model_cache,
             trust_remote_code=trust_remote_code,
             enable_cache=enable_cache,
-            cache_dir=cache_dir,
+            embedding_cache=embedding_cache,
         )
 
         # Prepare text data for embedding using the flexible method
         texts = self._prepare_texts()  # Generate embeddings
         embeddings = self.embedding_model.embed(texts)  # Configure index for caching
         if not hasattr(self.index, "cache") or self.index.cache is None:
-            self.index = FaissIndex(enable_cache=enable_cache, cache_dir=cache_dir)
+            self.index = FaissIndex(
+                enable_cache=enable_cache, index_cache=embedding_cache
+            )
 
         # Choose caching strategy
         if use_row_caching:

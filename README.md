@@ -52,7 +52,8 @@ search_engine.embedding(
     model_name_or_path="all-mpnet-base-v2",
     device="cpu",  # or "cuda"
     enable_cache=True,
-    cache_dir="./my_cache"
+    embedding_cache="./my_embedding_cache",
+    model_cache="./my_model_cache"
 )
 
 # Search with custom parameters

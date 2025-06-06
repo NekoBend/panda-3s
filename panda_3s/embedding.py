@@ -21,21 +21,19 @@ class Embedding:
         cache_folder: str | None = None,
         trust_remote_code: bool = False,
         enable_cache: bool = True,
-        cache_dir: str | None = None,
+        embedding_cache: str | None = None,
         max_shard_size: int = 10000,
         enable_hash_sharding: bool = True,
     ):
-        """Initialize the embedding model.
-
-        Args:
-            model_name_or_path: Name or path of the SentenceTransformer model
-            device: Device to run the model on (e.g., 'cuda', 'cpu')
-            cache_folder: Folder to cache model files
-            trust_remote_code: Whether to trust remote code
-            enable_cache: Whether to enable embedding caching
-            cache_dir: Directory for embedding cache files
-            max_shard_size: Maximum number of embeddings per shard file
-            enable_hash_sharding: Use hash-based sharding for better distribution
+        """Initialize the embedding model.        Args:
+        model_name_or_path: Name or path of the SentenceTransformer model
+        device: Device to run the model on (e.g., 'cuda', 'cpu')
+        cache_folder: Folder to cache model files
+        trust_remote_code: Whether to trust remote code
+        enable_cache: Whether to enable embedding caching
+        embedding_cache: Directory for embedding cache files
+        max_shard_size: Maximum number of embeddings per shard file
+        enable_hash_sharding: Use hash-based sharding for better distribution
         """
         self.model_name_or_path = model_name_or_path
         self.enable_cache = enable_cache
@@ -47,11 +45,11 @@ class Embedding:
             device=device,
             cache_folder=cache_folder,
             trust_remote_code=trust_remote_code,
-        )
-
-        # Initialize cache if enabled
+        )  # Initialize cache if enabled
         if self.enable_cache:
-            self.cache = EmbeddingCache(cache_dir, max_shard_size, enable_hash_sharding)
+            self.cache = EmbeddingCache(
+                embedding_cache, max_shard_size, enable_hash_sharding
+            )
             logger.info("Embedding cache enabled")
         else:
             self.cache = None

@@ -211,22 +211,16 @@ class EmbeddingCache:
                 shard_hash = _compute_shard_hash(text)
                 if shard_hash not in shard_groups:
                     shard_groups[shard_hash] = []
-                shard_groups[shard_hash].append((text, embeddings[i]))
-
-            # Save each shard
+                shard_groups[shard_hash].append((
+                    text,
+                    embeddings[i],
+                ))  # Save each shard
             for shard_hash, text_embedding_pairs in shard_groups.items():
-                shard_texts = [pair[0] for pair in text_embedding_pairs]
                 shard_embeddings = np.array([pair[1] for pair in text_embedding_pairs])
 
                 # Save embeddings using safetensors with simple naming
                 shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
                 save_file({"embeddings": shard_embeddings}, shard_file)
-
-                # Save corresponding text list
-                text_file = self.cache_dir / f"{cache_key}_{shard_hash}.txt"
-                with open(text_file, "w", encoding="utf-8") as f:
-                    for text in shard_texts:
-                        f.write(f"{text}\n")
 
             logger.info(
                 f"Saved {len(texts)} embeddings to hash-based cache in {len(shard_groups)} shards"
@@ -248,8 +242,6 @@ class EmbeddingCache:
             for shard_idx in range(num_shards):
                 start_idx = shard_idx * self.max_shard_size
                 end_idx = min(start_idx + self.max_shard_size, len(texts))
-
-                shard_texts = texts[start_idx:end_idx]
                 shard_embeddings = embeddings[start_idx:end_idx]
 
                 # Save embeddings using safetensors
@@ -257,12 +249,6 @@ class EmbeddingCache:
                     self.cache_dir / f"{cache_key}_shard_{shard_idx}.safetensors"
                 )
                 save_file({"embeddings": shard_embeddings}, shard_file)
-
-                # Save corresponding text list
-                text_file = self.cache_dir / f"{cache_key}_shard_{shard_idx}.txt"
-                with open(text_file, "w", encoding="utf-8") as f:
-                    for text in shard_texts:
-                        f.write(f"{text}\n")
 
             # Save metadata
             metadata = {

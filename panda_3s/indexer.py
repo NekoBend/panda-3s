@@ -39,9 +39,15 @@ class FaissIndex:
         self,
         dimension: int | None = None,
         enable_cache: bool = True,
-        cache_dir: str | None = None,
+        index_cache: str | None = None,
     ):
-        """Initialize FaissIndex."""
+        """Initialize FaissIndex.
+
+        Args:
+            dimension: Vector dimension for the index
+            enable_cache: Whether to enable index caching
+            index_cache: Directory for index cache files
+        """
         self.dimension = dimension
         self.index: faiss.Index | None = None
         self.documents: list[str] = []
@@ -50,7 +56,7 @@ class FaissIndex:
         self.cache: IndexCache | None = None
 
         if self.enable_cache:
-            self.cache = IndexCache(cache_dir)
+            self.cache = IndexCache(index_cache)
             logger.info("Index cache enabled")
         else:
             logger.info("Index cache disabled")
