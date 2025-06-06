@@ -45,11 +45,11 @@ class Embedding:
             device=device,
             cache_folder=cache_folder,
             trust_remote_code=trust_remote_code,
-        )  # Initialize cache if enabled
+        )
+
+        # Initialize cache if enabled
         if self.enable_cache:
-            self.cache = EmbeddingCache(
-                embedding_cache, max_shard_size, enable_hash_sharding
-            )
+            self.cache = EmbeddingCache(cache_dir=embedding_cache)
             logger.info("Embedding cache enabled")
         else:
             self.cache = None

@@ -67,33 +67,24 @@ class EmbeddingCache:
     def __init__(
         self,
         cache_dir: Optional[str] = None,
-        max_shard_size: int = 10000,
-        enable_hash_sharding: bool = True,
     ):
         """Initialize embedding cache.
 
         Args:
             cache_dir: Directory to store cache files (default: ~/.panda_3s_cache/embeddings)
-            max_shard_size: Maximum number of embeddings per shard file
-            enable_hash_sharding: Use hash-based sharding for better distribution
         """
         if cache_dir is None:
             self.cache_dir = Path.home() / ".panda_3s_cache" / "embeddings"
         else:
             self.cache_dir = Path(cache_dir)
 
-        self.max_shard_size = max_shard_size
-        self.enable_hash_sharding = enable_hash_sharding
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"EmbeddingCache initialized: {self.cache_dir}")
 
     def get_embeddings(self, texts: list[str], model_name: str) -> Optional[np.ndarray]:
         """Retrieve embeddings from cache with hash-based sharding and parallel loading."""
-        if self.enable_hash_sharding:
-            return self._get_embeddings_hash_sharded(texts, model_name)
-        else:
-            return self._get_embeddings_sequential_sharded(texts, model_name)
+        return self._get_embeddings_hash_sharded(texts, model_name)
 
     def _get_embeddings_hash_sharded(
         self, texts: list[str], model_name: str
@@ -107,9 +98,7 @@ class EmbeddingCache:
             shard_hash = _compute_shard_hash(text)
             if shard_hash not in shard_groups:
                 shard_groups[shard_hash] = []
-            shard_groups[shard_hash].append(text)
-
-        # Check if all required shards exist
+            shard_groups[shard_hash].append(text)        # Check if all required shards exist
         missing_shards = []
         for shard_hash in shard_groups:
             shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
@@ -126,13 +115,11 @@ class EmbeddingCache:
             def load_shard(shard_hash: str) -> tuple[str, dict[str, np.ndarray]]:
                 """Load a single shard file."""
                 shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
-                text_file = self.cache_dir / f"{cache_key}_{shard_hash}.txt"
 
                 with safe_open(shard_file, framework="numpy") as f:
                     embeddings = f.get_tensor("embeddings")
-
-                with open(text_file, "r", encoding="utf-8") as tf:
-                    shard_texts = [line.strip() for line in tf.readlines()]
+                    # Get texts from the shard_groups for this shard_hash
+                    shard_texts = shard_groups[shard_hash]
 
                 return shard_hash, {
                     text: embeddings[i] for i, text in enumerate(shard_texts)
@@ -153,9 +140,7 @@ class EmbeddingCache:
                         logger.error(
                             f"Error loading shard {future_to_shard[future]}: {e}"
                         )
-                        return None
-
-            # Build result array in the same order as input texts
+                        return None            # Build result array in the same order as input texts
             if not all(text in result_embeddings for text in texts):
                 logger.debug("Not all texts found in cache")
                 return None
@@ -175,29 +160,11 @@ class EmbeddingCache:
             logger.error(f"Error loading embeddings from hash-sharded cache: {e}")
             return None
 
-    def _get_embeddings_sequential_sharded(
-        self, texts: list[str], model_name: str
-    ) -> Optional[np.ndarray]:
-        """Retrieve embeddings from cache with parallel loading (legacy sequential sharding)."""
-        cache_key = _compute_cache_key(texts, model_name)
-
-        # Find all shard files for this cache key
-        shard_files = list(self.cache_dir.glob(f"{cache_key}_shard_*.safetensors"))
-        if not shard_files:
-            logger.debug(f"No cache found for key: {cache_key}")
-            return None
-
-        # Fallback to old logic - simplified for now
-        return None
-
     def save_embeddings(
         self, texts: list[str], model_name: str, embeddings: np.ndarray
     ) -> None:
-        """Save embeddings to cache with hash-based or sequential sharding."""
-        if self.enable_hash_sharding:
-            self._save_embeddings_hash_sharded(texts, model_name, embeddings)
-        else:
-            self._save_embeddings_sequential_sharded(texts, model_name, embeddings)
+        """Save embeddings to cache with hash-based sharding."""
+        self._save_embeddings_hash_sharded(texts, model_name, embeddings)
 
     def _save_embeddings_hash_sharded(
         self, texts: list[str], model_name: str, embeddings: np.ndarray
@@ -205,7 +172,7 @@ class EmbeddingCache:
         """Save embeddings to cache using hash-based sharding for better distribution."""
         cache_key = _compute_cache_key(texts, model_name)
 
-        try:  # Group texts by shard hash
+        try:            # Group texts by shard hash
             shard_groups: dict[str, list[tuple[str, np.ndarray]]] = {}
             for i, text in enumerate(texts):
                 shard_hash = _compute_shard_hash(text)
@@ -214,7 +181,9 @@ class EmbeddingCache:
                 shard_groups[shard_hash].append((
                     text,
                     embeddings[i],
-                ))  # Save each shard
+                ))
+
+            # Save each shard
             for shard_hash, text_embedding_pairs in shard_groups.items():
                 shard_embeddings = np.array([pair[1] for pair in text_embedding_pairs])
 
@@ -228,47 +197,6 @@ class EmbeddingCache:
 
         except Exception as e:
             logger.error(f"Error saving embeddings to hash-based cache: {e}")
-
-    def _save_embeddings_sequential_sharded(
-        self, texts: list[str], model_name: str, embeddings: np.ndarray
-    ) -> None:
-        """Save embeddings to cache using sequential sharding (legacy)."""
-        cache_key = _compute_cache_key(texts, model_name)
-
-        try:
-            # Calculate number of shards needed
-            num_shards = (len(texts) + self.max_shard_size - 1) // self.max_shard_size
-
-            for shard_idx in range(num_shards):
-                start_idx = shard_idx * self.max_shard_size
-                end_idx = min(start_idx + self.max_shard_size, len(texts))
-                shard_embeddings = embeddings[start_idx:end_idx]
-
-                # Save embeddings using safetensors
-                shard_file = (
-                    self.cache_dir / f"{cache_key}_shard_{shard_idx}.safetensors"
-                )
-                save_file({"embeddings": shard_embeddings}, shard_file)
-
-            # Save metadata
-            metadata = {
-                "texts": texts,
-                "model_name": model_name,
-                "num_shards": num_shards,
-                "embedding_dim": embeddings.shape[1],
-                "total_count": len(texts),
-            }
-
-            metadata_file = self.cache_dir / f"{cache_key}_metadata.json"
-            with open(metadata_file, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2)
-
-            logger.info(
-                f"Saved {len(texts)} embeddings to sequential cache in {num_shards} shards"
-            )
-
-        except Exception as e:
-            logger.error(f"Error saving embeddings to cache: {e}")
 
 
 class IndexCache:

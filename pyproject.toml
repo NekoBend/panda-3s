@@ -1,6 +1,6 @@
 [project]
 name = "panda-3s"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pandas-focused Semantic Search Suite - Simple and powerful semantic search for pandas DataFrames using Sentence Transformers and FAISS."
 readme = "README.md"
 license = { text = "MIT" }
