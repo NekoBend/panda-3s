@@ -8,6 +8,6 @@ from .core import PandaSearch
 from .embedding import Embedding
 from .indexer import FaissIndex
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = ["PandaSearch", "Embedding", "FaissIndex"]

@@ -38,9 +38,31 @@ def _compute_cache_key(texts: list[str], model_name: str) -> str:
     return _compute_hash(combined)
 
 
+def _compute_shard_path(text: str, cache_dir: Path) -> tuple[Path, str]:
+    """Compute shard directory path and filename for a text using directory-based sharding.
+
+    Uses full SHA256 hash for collision resistance:
+    - First 2 chars: Level 1 directory (256 possibilities)
+    - Next 2 chars: Level 2 directory (256 possibilities per level 1)
+    - Remaining chars: Filename (full collision resistance)
+
+    Returns:
+        tuple[Path, str]: (shard_directory, filename)
+    """
+    full_hash = _compute_hash(text)
+    # Use 2-level directory structure for better distribution
+    level1 = full_hash[:2]  # 00-ff (256 dirs)
+    level2 = full_hash[2:4]  # 00-ff (256 subdirs each)
+    filename = full_hash[4:]  # Remaining 56 chars for filename
+
+    shard_dir = cache_dir / level1 / level2
+    return shard_dir, filename
+
+
 def _compute_shard_hash(text: str) -> str:
-    """Compute shard hash for a single text to enable hash-based sharding."""
-    return _compute_hash(text, truncate=8)
+    """Compute shard identifier for a single text (backwards compatibility)."""
+    full_hash = _compute_hash(text)
+    return f"{full_hash[:2]}/{full_hash[2:4]}/{full_hash[4:]}"
 
 
 def _compute_row_hash(row_data: str) -> str:
@@ -64,10 +86,7 @@ def _compute_index_cache_key(df_hash: str, column: str, model_name: str) -> str:
 class EmbeddingCache:
     """Cache for embeddings using safetensors with hash-based sharding support."""
 
-    def __init__(
-        self,
-        cache_dir: Optional[str] = None,
-    ):
+    def __init__(self, cache_dir: Optional[str] = None):
         """Initialize embedding cache.
 
         Args:
@@ -79,7 +98,6 @@ class EmbeddingCache:
             self.cache_dir = Path(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
         logger.info(f"EmbeddingCache initialized: {self.cache_dir}")
 
     def get_embeddings(self, texts: list[str], model_name: str) -> Optional[np.ndarray]:
@@ -89,67 +107,95 @@ class EmbeddingCache:
     def _get_embeddings_hash_sharded(
         self, texts: list[str], model_name: str
     ) -> Optional[np.ndarray]:
-        """Get embeddings using hash-based sharding."""
+        """Get embeddings using directory-based sharding with full collision resistance."""
         cache_key = _compute_cache_key(texts, model_name)
 
-        # Group texts by shard hash
-        shard_groups: dict[str, list[str]] = {}
-        for text in texts:
-            shard_hash = _compute_shard_hash(text)
-            if shard_hash not in shard_groups:
-                shard_groups[shard_hash] = []
-            shard_groups[shard_hash].append(text)        # Check if all required shards exist
+        # Group texts by shard directory with their original indices
+        shard_groups: dict[str, list[tuple[int, str, Path]]] = {}
+        for i, text in enumerate(texts):
+            shard_dir, filename = _compute_shard_path(text, self.cache_dir)
+            shard_key = str(shard_dir.relative_to(self.cache_dir))
+
+            if shard_key not in shard_groups:
+                shard_groups[shard_key] = []
+            shard_groups[shard_key].append((
+                i,
+                text,
+                shard_dir / f"{cache_key}_{filename}.safetensors",
+            ))
+
+        # Check if all required shard files exist
         missing_shards = []
-        for shard_hash in shard_groups:
-            shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
-            if not shard_file.exists():
-                missing_shards.append(shard_hash)
+        for shard_key, shard_data in shard_groups.items():
+            for _, _, shard_file in shard_data:
+                if not shard_file.exists():
+                    missing_shards.append(str(shard_file))
+                    break
 
         if missing_shards:
-            logger.debug(f"Missing shards for cache key {cache_key}: {missing_shards}")
+            logger.debug(f"Missing shard files: {missing_shards}")
             return None
 
         try:
-            result_embeddings = {}
+            # Get first shard file to determine embedding dimension
+            first_shard_data = next(iter(shard_groups.values()))
+            first_shard_file = first_shard_data[0][2]  # Get first file path
 
-            def load_shard(shard_hash: str) -> tuple[str, dict[str, np.ndarray]]:
-                """Load a single shard file."""
-                shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
+            with safe_open(first_shard_file, framework="numpy") as f:
+                sample_embedding = f.get_tensor("embeddings")
+                embedding_dim = sample_embedding.shape[1]
 
-                with safe_open(shard_file, framework="numpy") as f:
-                    embeddings = f.get_tensor("embeddings")
-                    # Get texts from the shard_groups for this shard_hash
-                    shard_texts = shard_groups[shard_hash]
-
-                return shard_hash, {
-                    text: embeddings[i] for i, text in enumerate(shard_texts)
-                }
-
-            # Load shards in parallel
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                future_to_shard = {
-                    executor.submit(load_shard, shard_hash): shard_hash
-                    for shard_hash in shard_groups
-                }
-
-                for future in as_completed(future_to_shard):
-                    try:
-                        shard_hash, shard_embeddings = future.result()
-                        result_embeddings.update(shard_embeddings)
-                    except Exception as e:
-                        logger.error(
-                            f"Error loading shard {future_to_shard[future]}: {e}"
-                        )
-                        return None            # Build result array in the same order as input texts
-            if not all(text in result_embeddings for text in texts):
-                logger.debug("Not all texts found in cache")
-                return None
-
-            embedding_dim = next(iter(result_embeddings.values())).shape[0]
             final_embeddings = np.zeros((len(texts), embedding_dim), dtype=np.float32)
 
-            for i, text in enumerate(texts):
-                final_embeddings[i] = result_embeddings[text]
+            def load_shard_file(
+                shard_file: Path, original_indices: list[int]
+            ) -> tuple[Path, list[tuple[int, np.ndarray]] | None]:
+                """Load a single shard file and return embeddings with their indices."""
+                try:
+                    with safe_open(shard_file, framework="numpy") as f:
+                        embeddings = f.get_tensor("embeddings")
+
+                        return shard_file, [
+                            (original_idx, embeddings[shard_idx])
+                            for shard_idx, original_idx in enumerate(original_indices)
+                        ]
+                except Exception as e:
+                    logger.error(f"Error loading shard file {shard_file}: {e}")
+                    return shard_file, None
+
+            # Prepare file-to-indices mapping for parallel loading
+            file_to_indices: dict[Path, list[int]] = {}
+            for shard_data in shard_groups.values():
+                for original_idx, _, shard_file in shard_data:
+                    if shard_file not in file_to_indices:
+                        file_to_indices[shard_file] = []
+                    file_to_indices[shard_file].append(original_idx)
+
+            # Load shard files in parallel
+            successful_files = 0
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_file = {
+                    executor.submit(load_shard_file, shard_file, indices): shard_file
+                    for shard_file, indices in file_to_indices.items()
+                }
+
+                for future in as_completed(future_to_file):
+                    shard_file, shard_embeddings = future.result()
+                    if shard_embeddings is None:
+                        logger.error(f"Failed to load shard file {shard_file}")
+                        return None
+
+                    # Directly assign to final array
+                    for original_idx, embedding in shard_embeddings:
+                        final_embeddings[original_idx] = embedding
+
+                    successful_files += 1
+
+            if successful_files != len(file_to_indices):
+                logger.error(
+                    f"Only loaded {successful_files}/{len(file_to_indices)} shard files successfully"
+                )
+                return None
 
             logger.info(
                 f"Successfully loaded {len(texts)} embeddings from hash-sharded cache"
@@ -169,30 +215,32 @@ class EmbeddingCache:
     def _save_embeddings_hash_sharded(
         self, texts: list[str], model_name: str, embeddings: np.ndarray
     ) -> None:
-        """Save embeddings to cache using hash-based sharding for better distribution."""
+        """Save embeddings to cache using directory-based sharding with full collision resistance."""
         cache_key = _compute_cache_key(texts, model_name)
 
-        try:            # Group texts by shard hash
-            shard_groups: dict[str, list[tuple[str, np.ndarray]]] = {}
+        try:
+            # Group texts by shard directory
+            shard_files: dict[Path, list[tuple[str, np.ndarray]]] = {}
             for i, text in enumerate(texts):
-                shard_hash = _compute_shard_hash(text)
-                if shard_hash not in shard_groups:
-                    shard_groups[shard_hash] = []
-                shard_groups[shard_hash].append((
-                    text,
-                    embeddings[i],
-                ))
+                shard_dir, filename = _compute_shard_path(text, self.cache_dir)
+                shard_file = shard_dir / f"{cache_key}_{filename}.safetensors"
 
-            # Save each shard
-            for shard_hash, text_embedding_pairs in shard_groups.items():
+                if shard_file not in shard_files:
+                    shard_files[shard_file] = []
+                shard_files[shard_file].append((text, embeddings[i]))
+
+            # Save each shard file
+            for shard_file, text_embedding_pairs in shard_files.items():
+                # Ensure directory exists
+                shard_file.parent.mkdir(parents=True, exist_ok=True)
+
                 shard_embeddings = np.array([pair[1] for pair in text_embedding_pairs])
 
-                # Save embeddings using safetensors with simple naming
-                shard_file = self.cache_dir / f"{cache_key}_{shard_hash}.safetensors"
+                # Save embeddings using safetensors
                 save_file({"embeddings": shard_embeddings}, shard_file)
 
             logger.info(
-                f"Saved {len(texts)} embeddings to hash-based cache in {len(shard_groups)} shards"
+                f"Saved {len(texts)} embeddings to directory-based cache in {len(shard_files)} shard files"
             )
 
         except Exception as e:
@@ -200,7 +248,7 @@ class EmbeddingCache:
 
 
 class IndexCache:
-    """Cache for FAISS indexes."""
+    """Cache for FAISS indexes with row-level embedding support."""
 
     def __init__(self, cache_dir: Optional[str] = None):
         """Initialize index cache.
@@ -214,7 +262,6 @@ class IndexCache:
             self.cache_dir = Path(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
         logger.info(f"IndexCache initialized: {self.cache_dir}")
 
     def get_index(
@@ -260,7 +307,9 @@ class IndexCache:
         try:
             # Save FAISS index
             index_file = self.cache_dir / f"{cache_key}.faiss"
-            faiss.write_index(index, str(index_file))  # Save metadata
+            faiss.write_index(index, str(index_file))
+
+            # Save metadata
             metadata = {
                 "df_hash": df_hash,
                 "column": column,

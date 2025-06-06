@@ -140,23 +140,31 @@ class PandaSearch:
         if not hasattr(self.index, "cache") or self.index.cache is None:
             self.index = FaissIndex(
                 enable_cache=enable_cache, index_cache=embedding_cache
-            )
-
-        # Choose caching strategy
+            )  # Choose caching strategy
         if use_row_caching:
             # Use row-level caching for better granularity
-            primary_column = (
-                self.text_columns[0] if len(self.text_columns) == 1 else "combined_text"
-            )
+            primary_column = self.text_columns[0]  # Use first column for row caching
             self.index.add_dataframe_with_row_caching(
                 self.df, primary_column, embeddings, model_name_or_path
             )
             logger.info("Used row-level caching for embeddings")
         else:
             # Use traditional DataFrame-level caching
-            primary_column = (
-                self.text_columns[0] if len(self.text_columns) == 1 else "combined_text"
-            )
+            # For multi-column, we need to add a temporary combined column or use index-based approach
+            if len(self.text_columns) == 1:
+                primary_column = self.text_columns[0]
+            else:
+                # For multi-column, add combined text as temporary column
+                combined_texts = self._prepare_texts()
+                temp_df = self.df.copy()
+                temp_df["_temp_combined_text"] = combined_texts
+                self.index.add_dataframe(
+                    temp_df, "_temp_combined_text", embeddings, model_name_or_path
+                )
+                logger.info("Index construction completed")
+                self._is_indexed = True
+                return self
+
             self.index.add_dataframe(
                 self.df, primary_column, embeddings, model_name_or_path
             )
