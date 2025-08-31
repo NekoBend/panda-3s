@@ -57,3 +57,6 @@ logs/
 performance_results.json
 benchmark_*.json
 test_cache/
+
+# Project-specific exclusions
+TODO.md

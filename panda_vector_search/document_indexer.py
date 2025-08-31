@@ -170,7 +170,7 @@ class FaissVectorIndexer:
             )
             logger.debug(
                 f"Embeddings shape before add: {embeddings.shape}, dtype: {embeddings.dtype}"
-            )  # 追加
+            )
             self.index.add(embeddings.astype(np.float32))  # Pass only embeddings
 
             for _, row in df.iterrows():

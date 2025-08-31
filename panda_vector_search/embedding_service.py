@@ -109,118 +109,6 @@ class SentenceEmbeddingService:
             )
         return dimension_value
 
-    def _retrieve_cached_embeddings(
-        self, texts: List[str], cache_context_df: Optional[Any]
-    ) -> Tuple[List[Optional[np.ndarray]], List[Tuple[int, str]]]:
-        """Attempts to retrieve embeddings from cache for the given texts.
-
-        Args:
-            texts: List of texts to retrieve embeddings for.
-            cache_context_df: Optional DataFrame for cache key generation.
-
-        Returns:
-            A tuple containing:
-                - A list of embeddings (or None if not found) corresponding to the input texts.
-                - A list of tuples (original_index, text_value) for texts not found in cache.
-        """
-        if not self.enable_embedding_cache or not self.cache:
-            # Cache disabled or not initialized, all texts need encoding
-            return [None] * len(texts), list(enumerate(texts))
-
-        logger.debug(f"Attempting to retrieve {len(texts)} embeddings from cache...")
-        cached_embeddings_list, missing_texts_values = (
-            self.cache.retrieve_embeddings_batch(
-                texts, self.model_name_or_path, df=cache_context_df
-            )
-        )
-
-        # The current EmbeddingCacheManager.retrieve_embeddings_batch returns:
-        # 1. results: List[Optional[np.ndarray]] (embeddings or None, in order of input texts)
-        # 2. missing_texts_values: List[str] (actual text strings that were missing)
-
-        # We need to identify the original indices of the missing texts.
-        texts_to_encode: List[Tuple[int, str]] = []
-        num_found_in_cache = 0
-
-        for i, text in enumerate(texts):
-            if cached_embeddings_list[i] is not None:
-                num_found_in_cache += 1
-            else:
-                # This text was not in the cache (or failed to load), mark for encoding
-                texts_to_encode.append((i, text))
-
-        if num_found_in_cache > 0:
-            logger.info(
-                f"Retrieved {num_found_in_cache}/{len(texts)} embeddings from cache."
-            )
-        if not texts_to_encode:
-            logger.info("All requested embeddings were found in cache.")
-
-        return cached_embeddings_list, texts_to_encode
-
-    def _generate_and_store_embeddings_batch(
-        self,
-        texts_to_encode_values: List[str],
-        batch_size: int,
-        cache_context_df: Optional[Any],
-    ) -> Optional[np.ndarray]:
-        """Encodes a batch of texts and stores them in the cache if enabled.
-
-        Args:
-            texts_to_encode_values: List of text strings to encode.
-            batch_size: Batch size for model encoding.
-            cache_context_df: Optional DataFrame for cache key generation.
-
-        Returns:
-            A NumPy array of the newly encoded embeddings, or None if encoding fails.
-        """
-        if not texts_to_encode_values:
-            return np.array([], dtype=np.float32).reshape(0, self._embedding_dimension)
-
-        logger.info(
-            f"Encoding {len(texts_to_encode_values)} texts not found in cache..."
-        )
-        try:
-            newly_encoded_embeddings_np = self.model.encode(
-                texts_to_encode_values,
-                convert_to_numpy=True,
-                normalize_embeddings=True,  # Assuming normalization is desired
-                batch_size=batch_size,
-                show_progress_bar=len(texts_to_encode_values)
-                > 1000,  # Show progress for large batches
-            )
-            logger.info(f"Successfully encoded {len(texts_to_encode_values)} texts.")
-
-            if self.enable_embedding_cache and self.cache:
-                embeddings_to_store_list = [
-                    newly_encoded_embeddings_np[i]
-                    for i in range(len(texts_to_encode_values))
-                ]
-                logger.debug(
-                    f"Storing {len(texts_to_encode_values)} newly encoded embeddings to cache..."
-                )
-                success = self.cache.persist_embeddings_batch(
-                    texts_to_encode_values,
-                    embeddings_to_store_list,
-                    self.model_name_or_path,
-                    df=cache_context_df,
-                )
-                if success:
-                    logger.info(
-                        f"Successfully stored {len(texts_to_encode_values)} embeddings in cache."
-                    )
-                else:
-                    logger.warning(
-                        "Failed to store some or all new embeddings in cache."
-                    )
-            return newly_encoded_embeddings_np
-        except Exception as e:
-            logger.error(
-                f"Error during model encoding or caching for batch of {len(texts_to_encode_values)} texts: {e}",
-                exc_info=True,
-            )
-            return None
-
     def embed(
         self,
         texts: List[str],
@@ -236,106 +124,127 @@ class SentenceEmbeddingService:
 
         Returns:
             NumPy array of embeddings, in the same order as input texts.
-            If some embeddings fail, they might be missing or replaced by zeros (current: missing).
         """
         if not texts:
             return np.array([], dtype=np.float32).reshape(0, self._embedding_dimension)
 
         logger.debug(f"Request to embed {len(texts)} texts. Batch size: {batch_size}")
 
-        # Step 1: Try to get embeddings from cache
-        # final_embeddings will store results in the original order
-        final_embeddings, texts_needing_encoding_with_indices = (
-            self._retrieve_cached_embeddings(texts, cache_context_df)
+        # Try cache first if enabled
+        cached_results, missing_indices = self._get_cached_embeddings(
+            texts, cache_context_df
+        )
+        if not missing_indices:
+            return self._assemble_final_embeddings(cached_results, [])
+
+        # Encode missing texts
+        missing_texts = [texts[i] for i in missing_indices]
+        new_embeddings = self._encode_texts_batch(missing_texts, batch_size)
+        if new_embeddings is None:
+            return self._assemble_final_embeddings(cached_results, [])
+
+        # Store new embeddings in cache
+        if self.enable_embedding_cache and self.cache:
+            self._store_embeddings_batch(
+                missing_texts, new_embeddings, cache_context_df
+            )
+
+        # Combine cached and new embeddings
+        return self._assemble_final_embeddings(
+            cached_results, list(zip(missing_indices, new_embeddings))
         )
 
-        # texts_needing_encoding_with_indices is List[Tuple[int, str]]
-        # where int is the original index and str is the text.
+    def _get_cached_embeddings(
+        self, texts: List[str], cache_context_df: Optional[Any]
+    ) -> Tuple[List[Optional[np.ndarray]], List[int]]:
+        """Retrieve embeddings from cache.
 
-        if not texts_needing_encoding_with_indices:
-            logger.info("All embeddings successfully retrieved from cache.")
-            # Ensure all are np.ndarray before stacking and they are in correct order
-            # _retrieve_cached_embeddings already returns them in order with Nones
-            valid_cached_embeddings = [
-                emb for emb in final_embeddings if emb is not None
-            ]
-            if len(valid_cached_embeddings) == len(texts):
-                return np.array(valid_cached_embeddings)
-            else:
-                # This case (all found in cache but counts don't match) should ideally not happen
-                # if _retrieve_cached_embeddings is correct.
-                logger.error(
-                    "Cache retrieval inconsistency. Re-encoding problematic items or failing."
-                )
-                # Fallback: identify Nones and attempt to re-process or handle error
-                # For now, let's assume if texts_needing_encoding_with_indices is empty, all were found.
+        Returns:
+            Tuple of (cached_results, missing_indices)
+        """
+        if not self.enable_embedding_cache or not self.cache:
+            return [None] * len(texts), list(range(len(texts)))
 
-        # Step 2: Encode texts that were not found in cache
-        original_indices_to_encode = [
-            item[0] for item in texts_needing_encoding_with_indices
-        ]
-        texts_to_encode_values = [
-            item[1] for item in texts_needing_encoding_with_indices
-        ]
+        logger.debug(f"Attempting to retrieve {len(texts)} embeddings from cache")
+        cached_embeddings, _ = self.cache.retrieve_embeddings_batch(
+            texts, self.model_name_or_path, df=cache_context_df
+        )
 
-        if texts_to_encode_values:
-            newly_encoded_batch_np = self._generate_and_store_embeddings_batch(
-                texts_to_encode_values, batch_size, cache_context_df
-            )
+        missing_indices = [i for i, emb in enumerate(cached_embeddings) if emb is None]
+        found_count = len(texts) - len(missing_indices)
 
-            if newly_encoded_batch_np is not None and len(
-                newly_encoded_batch_np
-            ) == len(original_indices_to_encode):
-                # Place newly encoded embeddings into their correct positions in final_embeddings
-                for idx_in_batch, original_list_idx in enumerate(
-                    original_indices_to_encode
-                ):
-                    final_embeddings[original_list_idx] = newly_encoded_batch_np[
-                        idx_in_batch
-                    ]
-            elif newly_encoded_batch_np is None:
-                logger.error(
-                    f"Encoding failed for a batch of {len(texts_to_encode_values)} texts. "
-                    "These embeddings will be missing in the output."
-                )
-            else:  # Mismatch in length, should not happen if _generate_and_store_embeddings_batch is correct
-                logger.error(
-                    f"Mismatch in length between encoded batch ({len(newly_encoded_batch_np)}) and "
-                    f"expected ({len(original_indices_to_encode)}). Some embeddings may be misplaced or missing."
-                )
+        if found_count > 0:
+            logger.info(f"Retrieved {found_count}/{len(texts)} embeddings from cache")
 
-        # Step 3: Assemble final results
-        # final_embeddings list now contains a mix of cached and newly encoded embeddings (or None for failures)
+        return cached_embeddings, missing_indices
 
-        processed_embeddings: List[np.ndarray] = []
-        for i, emb in enumerate(final_embeddings):
-            if emb is None:
-                logger.warning(  # Changed to warning, as error was logged during encoding failure
-                    f"Embedding for text index {i} ('{texts[i][:50]}...') is None after processing. "
-                    "This indicates it was not found in cache and encoding failed or was skipped."
-                )
-                # Option: Fill with zeros of self._embedding_dimension, or skip.
-                # Current behavior: skip, leading to a potentially shorter result array than input texts.
-                # To maintain length, one might do:
-                # processed_embeddings.append(np.zeros(self._embedding_dimension, dtype=np.float32))
-            else:
-                processed_embeddings.append(emb)
+    def _encode_texts_batch(
+        self, texts: List[str], batch_size: int
+    ) -> Optional[np.ndarray]:
+        """Encode texts using the model.
 
-        if not processed_embeddings:
-            logger.error(
-                "No embeddings could be successfully processed or retrieved for the batch."
-            )
+        Returns:
+            Encoded embeddings or None on failure.
+        """
+        if not texts:
             return np.array([], dtype=np.float32).reshape(0, self._embedding_dimension)
 
-        # If we want to ensure the output array has the same number of rows as input texts,
-        # and fill failures with zeros:
-        # final_result_array = np.zeros((len(texts), self._embedding_dimension), dtype=np.float32)
-        # for i, emb in enumerate(final_embeddings):
-        #     if emb is not None:
-        #         final_result_array[i] = emb
-        # return final_result_array
-        # For now, returning only successfully processed embeddings:
-        return np.array(processed_embeddings)
+        logger.info(f"Encoding {len(texts)} texts")
+        try:
+            embeddings = self.model.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=batch_size,
+                show_progress_bar=len(texts) > 1000,
+            )
+            logger.info(f"Successfully encoded {len(texts)} texts")
+            return embeddings
+        except Exception as e:
+            logger.error(f"Encoding failed for {len(texts)} texts: {e}", exc_info=True)
+            return None
+
+    def _store_embeddings_batch(
+        self, texts: List[str], embeddings: np.ndarray, cache_context_df: Optional[Any]
+    ) -> None:
+        """Store embeddings in cache."""
+        if not self.cache:
+            return
+
+        logger.debug(f"Storing {len(texts)} embeddings in cache")
+        embeddings_list = [embeddings[i] for i in range(len(texts))]
+        success = self.cache.persist_embeddings_batch(
+            texts, embeddings_list, self.model_name_or_path, df=cache_context_df
+        )
+        if success:
+            logger.info(f"Successfully cached {len(texts)} embeddings")
+        else:
+            logger.warning("Failed to cache some embeddings")
+
+    def _assemble_final_embeddings(
+        self,
+        cached_results: List[Optional[np.ndarray]],
+        new_results: List[Tuple[int, np.ndarray]],
+    ) -> np.ndarray:
+        """Assemble final embeddings from cached and new results."""
+        # Create mapping of new embeddings by index
+        new_embeddings_map = dict(new_results)
+
+        final_embeddings = []
+        for i, cached_emb in enumerate(cached_results):
+            if cached_emb is not None:
+                final_embeddings.append(cached_emb)
+            elif i in new_embeddings_map:
+                final_embeddings.append(new_embeddings_map[i])
+            else:
+                logger.warning(f"No embedding available for text at index {i}")
+                # Skip missing embeddings rather than adding zeros
+                continue
+
+        if not final_embeddings:
+            return np.array([], dtype=np.float32).reshape(0, self._embedding_dimension)
+
+        return np.array(final_embeddings)
 
     def get_embedding_dimension(self) -> int:
         """Get the dimension of embeddings generated by this model."""
